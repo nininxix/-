@@ -33,7 +33,7 @@ DEBUG_ADDRESS = "127.0.0.1:9222"
 # 获取方法：登录贴吧 -> 点自己头像进个人主页 -> 点「回贴」tab
 #           -> 复制地址栏完整网址，整段替换掉下面这个占位符。
 # 形如：https://tieba.baidu.com/home/main?id=填写你的贴吧ID&fr=personalize_page
-TIEBA_URL = "你的贴吧主页URL"
+TIEBA_URL = "填写你的贴吧主页URL"
 
 # 最大删除数量（删够就自动停）
 MAX_DELETE_COUNT = 500
