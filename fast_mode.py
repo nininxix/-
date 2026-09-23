@@ -61,8 +61,9 @@ MAX_DELETE_COUNT = 500
 DELETE_WAIT = (2.0, 4.0)
 NORMAL_WAIT = (0.8, 1.6)
 
-# 签名密钥。若接口失效，大概率是这里变了，需要重新抓包核对。
-SIGN_SECRET = "tiebaclient!!!"
+# 签名密钥（贴吧 PC 端 /c/ 接口通用，源自开源项目 MediaCrawler）。
+# 若接口失效，大概率是这里变了，需要重新抓包核对。
+SIGN_SECRET = "36770b1f34c9bbf2e7d1a99d2b82fa9e"
 
 # ================= 工具 =================
 
@@ -80,12 +81,16 @@ def check_stop():
 
 
 def compute_sign(params):
-    """按贴吧客户端接口规则计算 sign（MD5）。
+    """按贴吧 PC 端接口规则计算 sign（MD5）。
 
-    规则：所有参数按 key 排序，拼成 k=v 串，末尾追加密钥，再取 MD5。
-    若接口返回的数据不对，优先排查这里（密钥或拼法可能已更新）。
+    规则：参数按 key 升序，跳过 sign/sig 和 None，拼成 k=v 串（无分隔符），
+    末尾追加密钥，再取 MD5（小写）。
     """
-    base = "".join(f"{k}={params[k]}" for k in sorted(params.keys()))
+    base = "".join(
+        f"{k}={params[k]}"
+        for k in sorted(params.keys())
+        if k not in {"sign", "sig"} and params[k] is not None
+    )
     return hashlib.md5((base + SIGN_SECRET).encode("utf-8")).hexdigest()
 
 
@@ -98,12 +103,37 @@ def create_driver():
     return webdriver.Edge(options=options)
 
 
-def open_reply(driver, wait):
-    """打开「回贴」tab，确保页面上下文里能读到 tbs。"""
+def find_tieba_window(driver):
+    """在已打开的窗口里找一个 tieba.baidu.com 的标签页并切换过去。"""
     try:
-        tab = wait.until(EC.element_to_be_clickable((By.ID, "tab-reply")))
-        driver.execute_script("arguments[0].click();", tab)
-        time.sleep(3)
+        for handle in driver.window_handles:
+            try:
+                driver.switch_to.window(handle)
+                if "tieba.baidu.com" in driver.current_url:
+                    log(f"已切到 tieba 标签页: {driver.current_url[:60]}")
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
+def setup_page(driver):
+    """确保落在 tieba 页面上。
+
+    优先复用你已经在调试版 Edge 里打开的 tieba 标签（不重新 driver.get 导航，
+    避免导航中途把窗口/标签搞丢）。实在没有才导航过去。
+    """
+    log(f"当前窗口数: {len(driver.window_handles)}")
+    if find_tieba_window(driver):
+        time.sleep(2)
+        return True
+    try:
+        log("未找到现成 tieba 标签，尝试导航")
+        driver.get(TIEBA_URL)
+        time.sleep(5)
+        driver.switch_to.window(driver.window_handles[-1])
         return True
     except Exception:
         traceback.print_exc()
@@ -111,13 +141,32 @@ def open_reply(driver, wait):
 
 
 def get_tbs(driver):
-    """从页面里读 tbs（CSRF token，删除接口要用）。"""
+    """获取 tbs（CSRF token，删除接口要用）。
+
+    先从当前页面读（PageData.tbs / window.tbs），读不到就调贴吧 sync 接口拿。
+    """
     try:
         tbs = driver.execute_script(
-            "return (window.PageData && PageData.tbs) || window.tbs || '';"
+            "var pd = window.PageData || {};"
+            "return pd.tbs || (pd.user && pd.user.tbs) || window.tbs || '';"
         )
-        return tbs or ""
+        if tbs:
+            return tbs
     except Exception:
+        pass
+
+    # 页面里读不到，调 sync 接口
+    params = {"subapp_type": "pc", "_client_type": "20"}
+    params["sign"] = compute_sign(params)
+    url = "https://tieba.baidu.com/c/s/pc/sync?" + urlencode(params)
+    try:
+        data = fetch_json(driver, url)
+        tbs = (((data or {}).get("data") or {}).get("anti") or {}).get("tbs", "")
+        if tbs:
+            log("已从 sync 接口获取 tbs")
+        return tbs
+    except Exception as e:
+        log(f"获取 tbs 失败: {e}")
         return ""
 
 
@@ -196,13 +245,19 @@ def delete_reply(driver, fid, tid, pid, tbs):
     return fetch_json(driver, url)
 
 
-def collect_all(driver, portrait):
-    """翻页收集所有回帖，返回 [(pid, tid, fid), ...]。"""
+def collect_all(driver, portrait, max_items=None):
+    """翻页收集回帖，返回 [(pid, tid, fid), ...]。
+
+    max_items: 最多收集多少条（None=不限制，全部收完）。
+    """
     items = []
     pn = 1
     while True:
         if check_stop():
             break
+        if max_items is not None and len(items) >= max_items:
+            break
+
         data = fetch_replies(driver, pn, portrait)
         if not data:
             log(f"第 {pn} 页无数据或解析失败，停止翻页")
@@ -218,6 +273,10 @@ def collect_all(driver, portrait):
         has_more = body.get("has_more", 0)
         log(f"第 {pn} 页：{len(lst)} 条（has_more={has_more}）")
 
+        if not lst and has_more:
+            log(f"第 {pn} 页空列表但 has_more={has_more}，判定为结束")
+            break
+
         for item in lst:
             post = item.get("post_info") or {}
             thread = item.get("thread_info") or {}
@@ -226,6 +285,8 @@ def collect_all(driver, portrait):
             fid = thread.get("fid")
             if pid and tid and fid:
                 items.append((pid, tid, fid))
+                if max_items is not None and len(items) >= max_items:
+                    break
 
         if not has_more:
             break
@@ -256,9 +317,9 @@ def main():
     wait = WebDriverWait(driver, 15)
     log("连接成功")
 
-    driver.get(TIEBA_URL)
-    time.sleep(5)
-    open_reply(driver, wait)
+    if not setup_page(driver):
+        log("无法落到 tieba 页面，请确认调试版 Edge 里已打开并登录贴吧，然后重试")
+        return
 
     portrait = extract_portrait(TIEBA_URL)
     if not portrait:
@@ -269,7 +330,8 @@ def main():
     if not tbs:
         log("警告：未能从页面读取 tbs，删除接口可能失败")
 
-    items = collect_all(driver, portrait)
+    limit = None if list_only else MAX_DELETE_COUNT
+    items = collect_all(driver, portrait, max_items=limit)
     log(f"共收集到 {len(items)} 条回帖")
 
     if list_only:
@@ -293,13 +355,14 @@ def main():
             sleep_random(*DELETE_WAIT)
             continue
 
-        err = (resp or {}).get("error_code", -1)
-        if err == 0:
+        resp_dict = resp or {}
+        err = resp_dict.get("error_code", resp_dict.get("no", -1))
+        if str(err) in {"0", "None"}:
             delete_count += 1
             log(f"[{delete_count}/{len(items)}] 已删除 pid={pid}")
         else:
-            msg = (resp or {}).get("error_msg") or (resp or {}).get("error") or ""
-            log(f"删除失败 pid={pid}，error_code={err} {msg}")
+            msg = resp_dict.get("error_msg") or resp_dict.get("error") or resp_dict.get("msg") or ""
+            log(f"删除失败 pid={pid}，err={err} {msg}")
 
         sleep_random(*DELETE_WAIT)
 
