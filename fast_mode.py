@@ -19,7 +19,8 @@
 
 用法：
     uv run fast_mode.py --list-only   # 只列出回帖数量，不删除
-    uv run fast_mode.py               # 真正删除
+    uv run fast_mode.py               # 连续删除，直到删完或命中风控自动停
+    uv run fast_mode.py --limit 3     # 只删 3 条就停（试跑/分批）
 """
 
 import os
@@ -54,12 +55,15 @@ DELETE_API = "https://tieba.baidu.com/c/c/bawu/delpost_pc"
 # 每页条数（贴吧默认 20，一般不用改）
 PAGE_SIZE = 20
 
-# 最大删除数量（删够自动停）
-MAX_DELETE_COUNT = 500
+# 连续模式下，每轮先拉这么多条、删完再重新拉（一般不用改）
+BATCH_SIZE = 20
 
 # 删除后随机等待（秒）。接口版别太猛，太短容易「操作频繁」
 DELETE_WAIT = (2.0, 4.0)
 NORMAL_WAIT = (0.8, 1.6)
+
+# 删除接口返回里命中这些关键词，就判定为「操作频繁/风控」并自动停止
+RATE_LIMIT_KEYWORDS = ["频繁", "太快", "稍后", "稍候", "限制", "风控", "操作太", "系统繁忙", "请求过于"]
 
 # 签名密钥（贴吧 PC 端 /c/ 接口通用，源自开源项目 MediaCrawler）。
 # 若接口失效，大概率是这里变了，需要重新抓包核对。
@@ -78,6 +82,17 @@ def sleep_random(a, b):
 
 def check_stop():
     return os.path.exists("stop.txt")
+
+
+def is_rate_limited(resp):
+    """判断删除响应是否命中「操作频繁/风控」。"""
+    if not resp:
+        return False
+    try:
+        text = json.dumps(resp, ensure_ascii=False)
+    except Exception:
+        text = str(resp)
+    return any(k in text for k in RATE_LIMIT_KEYWORDS)
 
 
 def compute_sign(params):
@@ -301,6 +316,16 @@ def collect_all(driver, portrait, max_items=None):
 def main():
     list_only = "--list-only" in sys.argv
 
+    # --limit N：本次只删 N 条就停（试跑/分批用）。
+    # 不带 --limit：连续删到底，直到删完或命中风控才停。
+    limit = None
+    for i, a in enumerate(sys.argv):
+        if a == "--limit" and i + 1 < len(sys.argv):
+            try:
+                limit = int(sys.argv[i + 1])
+            except ValueError:
+                limit = None
+
     print(
         """
 ========================
@@ -314,7 +339,6 @@ def main():
 
     driver = create_driver()
     driver.set_script_timeout(20)
-    wait = WebDriverWait(driver, 15)
     log("连接成功")
 
     if not setup_page(driver):
@@ -330,41 +354,57 @@ def main():
     if not tbs:
         log("警告：未能从页面读取 tbs，删除接口可能失败")
 
-    limit = None if list_only else MAX_DELETE_COUNT
-    items = collect_all(driver, portrait, max_items=limit)
-    log(f"共收集到 {len(items)} 条回帖")
-
     if list_only:
+        items = collect_all(driver, portrait)
+        log(f"共 {len(items)} 条回帖")
         log("list-only 模式：只列出，不删除，结束")
         return
 
     delete_count = 0
-    for pid, tid, fid in items:
+    while True:
         if check_stop():
             log("检测到 stop.txt，退出")
             break
-        if delete_count >= MAX_DELETE_COUNT:
-            log("达到最大删除数量")
+        if limit is not None and delete_count >= limit:
+            log(f"已达到本次上限 {limit} 条，停止")
             break
 
-        try:
-            resp = delete_reply(driver, fid, tid, pid, tbs)
-        except Exception:
-            log(f"删除失败 pid={pid}（请求异常）")
-            traceback.print_exc()
+        # 拉一批（当前最前面的若干条）
+        batch_limit = BATCH_SIZE if limit is None else min(BATCH_SIZE, limit - delete_count)
+        batch = collect_all(driver, portrait, max_items=batch_limit)
+        if not batch:
+            log("没有回帖了，全部删完")
+            break
+
+        for pid, tid, fid in batch:
+            if check_stop():
+                log("检测到 stop.txt，退出")
+                break
+            if limit is not None and delete_count >= limit:
+                break
+
+            try:
+                resp = delete_reply(driver, fid, tid, pid, tbs)
+            except Exception:
+                log(f"删除失败 pid={pid}（请求异常）")
+                traceback.print_exc()
+                sleep_random(*DELETE_WAIT)
+                continue
+
+            resp_dict = resp or {}
+            err = resp_dict.get("error_code", resp_dict.get("no", -1))
+            if str(err) in {"0", "None"}:
+                delete_count += 1
+                log(f"[{delete_count}] 已删除 pid={pid}")
+            elif is_rate_limited(resp_dict):
+                log("⚠️ 检测到「操作频繁/风控」，已自动停止。")
+                log(f"    本次共删除 {delete_count} 条，请等待一段时间（几十分钟到几小时）后再运行。")
+                return
+            else:
+                msg = resp_dict.get("error_msg") or resp_dict.get("error") or resp_dict.get("msg") or ""
+                log(f"删除失败 pid={pid}，err={err} {msg}")
+
             sleep_random(*DELETE_WAIT)
-            continue
-
-        resp_dict = resp or {}
-        err = resp_dict.get("error_code", resp_dict.get("no", -1))
-        if str(err) in {"0", "None"}:
-            delete_count += 1
-            log(f"[{delete_count}/{len(items)}] 已删除 pid={pid}")
-        else:
-            msg = resp_dict.get("error_msg") or resp_dict.get("error") or resp_dict.get("msg") or ""
-            log(f"删除失败 pid={pid}，err={err} {msg}")
-
-        sleep_random(*DELETE_WAIT)
 
     log(f"完成，总删除 {delete_count} 条")
 
