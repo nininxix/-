@@ -91,11 +91,11 @@
 ### 第 0 步：下载本项目
 
 ```bash
-git clone git@github.com:nininxix/-.git
-cd -
+git clone git@github.com:nininxix/baidu-tieba-delete-script.git
+cd baidu-tieba-delete-script
 ```
 
-> 仓库名就叫 `-`（一个短横线），所以 `cd -` 进去。如果你用别的名字克隆，进对应目录即可。
+> 克隆下来后进入 `baidu-tieba-delete-script` 目录即可。
 
 ### 第 1 步：安装 uv（没装的话）
 
