@@ -20,8 +20,7 @@
 10. [安全措施](#安全措施)
 11. [文件说明](#文件说明)
 12. [常见问题（FAQ）](#常见问题faq)
-13. [进阶：直接调接口加速](#进阶直接调接口加速跳过浏览器)
-14. [免责声明](#免责声明)
+13. [免责声明](#免责声明)
 
 ---
 
@@ -323,7 +322,8 @@ ActionChains(driver).move_to_element(more).perform()
 
 ```
 .
-├── main.py             # 主程序（配置都在这文件顶部）
+├── main.py             # 主程序（UI 自动化版，配置都在文件顶部）
+├── fast_mode.py        # 接口加速版（实验性，连浏览器后直接调接口）
 ├── pyproject.toml      # uv 项目配置，声明依赖 selenium
 ├── start_edge.bat      # 双击启动「调试版 Edge」（Windows 双击友好）
 ├── start_edge.ps1      # 同上，PowerShell 版
@@ -366,14 +366,6 @@ ActionChains(driver).move_to_element(more).perform()
 一般要重新抓的是 `get_replies` 里的 `REPLY_LIST_XPATH`，以及 `.thread-setting`、删除/确定按钮的定位。
 
 ---
-
-## 进阶：直接调接口加速（跳过浏览器）
-
-当前方案走浏览器 UI，稳定但慢。想再快一个数量级，可以分析贴吧的**分页接口**，直接用 HTTP 请求拿数据 + 删除，绕过页面滚动和刷新。
-
-完整方法（怎么抓包、怎么看参数、怎么用 requests 复刻、怎么抓删除接口）见：
-
-- [docs/分页接口分析.md](docs/分页接口分析.md)
 
 ## 免责声明
 

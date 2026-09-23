@@ -1,0 +1,310 @@
+# -*- coding: utf-8 -*-
+
+"""
+百度贴吧自动删除回帖工具 · 接口加速版（实验性）
+
+和 main.py 一样，连接你已经登录的 Edge 浏览器。区别是：不再点页面的 DOM，
+而是在浏览器内部用 fetch 直接调用贴吧的接口拿列表、执行删除。
+
+优点：
+1. 快：一次请求拿一页回帖，删除也是单次请求，不用滚动 / 刷新 / 点按钮。
+2. 安全：cookies 由浏览器自动带上，代码里绝不出现、绝不落盘任何 Cookie 或密钥。
+
+重要提醒：
+1. 贴吧接口带 sign 签名参数。若列表返回空或报错，优先看 compute_sign() 函数
+   （签名算法或密钥可能已更新）。
+2. 接口直连比 UI 自动化更容易触发「操作频繁」。脚本已内置随机等待，
+   请勿把等待调太小。你之前删到几百条后遇到「操作频繁」，就是节奏太快。
+3. 建议先用 --list-only 只拉列表核对，确认无误再真正删除。
+
+用法：
+    uv run fast_mode.py --list-only   # 只列出回帖数量，不删除
+    uv run fast_mode.py               # 真正删除
+"""
+
+import os
+import sys
+import time
+import random
+import json
+import hashlib
+import traceback
+from datetime import datetime
+from urllib.parse import urlencode
+
+from selenium import webdriver
+from selenium.webdriver.edge.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+
+# ================= 配置 =================
+
+# Edge 调试地址（和启动 Edge 的命令一致）
+DEBUG_ADDRESS = "127.0.0.1:9222"
+
+# ★★★ 必改：你的贴吧个人主页地址（和 main.py 里一样）★★★
+# 形如 https://tieba.baidu.com/home/main?id=你的贴吧ID&fr=personalize_page
+TIEBA_URL = "你的贴吧主页URL"
+
+# 列表接口 / 删除接口
+FEED_API = "https://tieba.baidu.com/c/u/feed/myThread"
+DELETE_API = "https://tieba.baidu.com/c/c/bawu/delpost_pc"
+
+# 每页条数（贴吧默认 20，一般不用改）
+PAGE_SIZE = 20
+
+# 最大删除数量（删够自动停）
+MAX_DELETE_COUNT = 500
+
+# 删除后随机等待（秒）。接口版别太猛，太短容易「操作频繁」
+DELETE_WAIT = (2.0, 4.0)
+NORMAL_WAIT = (0.8, 1.6)
+
+# 签名密钥。若接口失效，大概率是这里变了，需要重新抓包核对。
+SIGN_SECRET = "tiebaclient!!!"
+
+# ================= 工具 =================
+
+
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+
+def sleep_random(a, b):
+    time.sleep(random.uniform(a, b))
+
+
+def check_stop():
+    return os.path.exists("stop.txt")
+
+
+def compute_sign(params):
+    """按贴吧客户端接口规则计算 sign（MD5）。
+
+    规则：所有参数按 key 排序，拼成 k=v 串，末尾追加密钥，再取 MD5。
+    若接口返回的数据不对，优先排查这里（密钥或拼法可能已更新）。
+    """
+    base = "".join(f"{k}={params[k]}" for k in sorted(params.keys()))
+    return hashlib.md5((base + SIGN_SECRET).encode("utf-8")).hexdigest()
+
+
+# ================= 浏览器 =================
+
+
+def create_driver():
+    options = Options()
+    options.add_experimental_option("debuggerAddress", DEBUG_ADDRESS)
+    return webdriver.Edge(options=options)
+
+
+def open_reply(driver, wait):
+    """打开「回贴」tab，确保页面上下文里能读到 tbs。"""
+    try:
+        tab = wait.until(EC.element_to_be_clickable((By.ID, "tab-reply")))
+        driver.execute_script("arguments[0].click();", tab)
+        time.sleep(3)
+        return True
+    except Exception:
+        traceback.print_exc()
+        return False
+
+
+def get_tbs(driver):
+    """从页面里读 tbs（CSRF token，删除接口要用）。"""
+    try:
+        tbs = driver.execute_script(
+            "return (window.PageData && PageData.tbs) || window.tbs || '';"
+        )
+        return tbs or ""
+    except Exception:
+        return ""
+
+
+def extract_portrait(url):
+    """从主页 URL 里取 id= 参数，那个就是你的 portrait（列表接口需要传）。"""
+    if "id=" in url:
+        part = url.split("id=", 1)[1]
+        return part.split("&", 1)[0]
+    return ""
+
+
+def fetch_json(driver, url):
+    """在浏览器内部 fetch 一个接口，返回解析后的 JSON dict。
+
+    fetch 在页面上下文里执行，cookies 自动带上，无需手动处理登录态。
+    """
+    js = (
+        "var url = arguments[0];"
+        "var cb = arguments[arguments.length - 1];"
+        "fetch(url, {credentials:'include'})"
+        ".then(function(r){return r.text();})"
+        ".then(function(t){cb(t);})"
+        ".catch(function(e){cb('__ERR__' + e);});"
+    )
+    raw = driver.execute_async_script(js, url)
+    if raw is None:
+        raise RuntimeError("fetch 无返回")
+    if isinstance(raw, str) and raw.startswith("__ERR__"):
+        raise RuntimeError(raw)
+    try:
+        return json.loads(raw)
+    except Exception:
+        log(f"非 JSON 返回：{raw[:200]}")
+        return None
+
+
+# ================= 接口 =================
+
+
+def fetch_replies(driver, pn, portrait):
+    """拉取第 pn 页「我的回贴」列表。"""
+    params = {
+        "_client_type": "20",
+        "pn": str(pn),
+        "portrait": portrait,
+        "rn": str(PAGE_SIZE),
+        "subapp_type": "pc",
+        "type": "2",
+        "un": "",
+    }
+    params["sign"] = compute_sign(params)
+    url = FEED_API + "?" + urlencode(params)
+    return fetch_json(driver, url)
+
+
+def delete_reply(driver, fid, tid, pid, tbs):
+    """删除一条回贴。
+
+    fid = 吧 id（thread_info.fid）
+    tid = 帖子 id（thread_info.tid，即接口里的 z）
+    pid = 回贴 id（post_info.id，即接口里的 pid）
+    """
+    params = {
+        "_client_type": "20",
+        "bawu_del_reason_info": "",
+        "fid": str(fid),
+        "owner_uid": "0",
+        "pid": str(pid),
+        "reason": "",
+        "subapp_type": "pc",
+        "tbs": tbs,
+        "z": str(tid),
+    }
+    params["sign"] = compute_sign(params)
+    url = DELETE_API + "?" + urlencode(params)
+    return fetch_json(driver, url)
+
+
+def collect_all(driver, portrait):
+    """翻页收集所有回帖，返回 [(pid, tid, fid), ...]。"""
+    items = []
+    pn = 1
+    while True:
+        if check_stop():
+            break
+        data = fetch_replies(driver, pn, portrait)
+        if not data:
+            log(f"第 {pn} 页无数据或解析失败，停止翻页")
+            break
+
+        err = data.get("error_code", 0)
+        if err != 0:
+            log(f"第 {pn} 页返回错误码 {err}，msg={data.get('error_msg') or data.get('error')}")
+            break
+
+        body = data.get("data") or {}
+        lst = body.get("list") or []
+        has_more = body.get("has_more", 0)
+        log(f"第 {pn} 页：{len(lst)} 条（has_more={has_more}）")
+
+        for item in lst:
+            post = item.get("post_info") or {}
+            thread = item.get("thread_info") or {}
+            pid = post.get("id")
+            tid = thread.get("tid")
+            fid = thread.get("fid")
+            if pid and tid and fid:
+                items.append((pid, tid, fid))
+
+        if not has_more:
+            break
+        pn += 1
+        sleep_random(*NORMAL_WAIT)
+    return items
+
+
+# ================= 主程序 =================
+
+
+def main():
+    list_only = "--list-only" in sys.argv
+
+    print(
+        """
+========================
+贴吧删除工具 · 接口加速版
+输入 YES 开始
+========================
+"""
+    )
+    if input("> ") != "YES":
+        return
+
+    driver = create_driver()
+    driver.set_script_timeout(20)
+    wait = WebDriverWait(driver, 15)
+    log("连接成功")
+
+    driver.get(TIEBA_URL)
+    time.sleep(5)
+    open_reply(driver, wait)
+
+    portrait = extract_portrait(TIEBA_URL)
+    if not portrait:
+        log("警告：未能从 TIEBA_URL 解析出 portrait（id= 参数），列表接口可能失败")
+    log(f"portrait={portrait or '未解析'}")
+
+    tbs = get_tbs(driver)
+    if not tbs:
+        log("警告：未能从页面读取 tbs，删除接口可能失败")
+
+    items = collect_all(driver, portrait)
+    log(f"共收集到 {len(items)} 条回帖")
+
+    if list_only:
+        log("list-only 模式：只列出，不删除，结束")
+        return
+
+    delete_count = 0
+    for pid, tid, fid in items:
+        if check_stop():
+            log("检测到 stop.txt，退出")
+            break
+        if delete_count >= MAX_DELETE_COUNT:
+            log("达到最大删除数量")
+            break
+
+        try:
+            resp = delete_reply(driver, fid, tid, pid, tbs)
+        except Exception:
+            log(f"删除失败 pid={pid}（请求异常）")
+            traceback.print_exc()
+            sleep_random(*DELETE_WAIT)
+            continue
+
+        err = (resp or {}).get("error_code", -1)
+        if err == 0:
+            delete_count += 1
+            log(f"[{delete_count}/{len(items)}] 已删除 pid={pid}")
+        else:
+            msg = (resp or {}).get("error_msg") or (resp or {}).get("error") or ""
+            log(f"删除失败 pid={pid}，error_code={err} {msg}")
+
+        sleep_random(*DELETE_WAIT)
+
+    log(f"完成，总删除 {delete_count} 条")
+
+
+if __name__ == "__main__":
+    main()
