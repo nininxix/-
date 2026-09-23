@@ -49,7 +49,24 @@ uv sync
 
 ### 第 3 步：启动调试版 Edge 并登录
 
-双击 `start_edge.bat`，会弹出一个**独立配置目录**的 Edge 窗口（不影响你日常用的 Edge）。在这个窗口里打开 `tieba.baidu.com` 登录，然后**保持窗口开着**。
+任选下面一种方式启动一个「带调试端口」的 Edge，然后在弹出的窗口里打开 `tieba.baidu.com` 登录，**保持窗口开着**。
+
+**方式 A：双击脚本（最简单）**
+
+- `start_edge.bat` —— 双击运行（cmd 环境）；
+- `start_edge.ps1` —— 右键「用 PowerShell 运行」。
+
+两个脚本做的是同一件事，只是面向不同的 shell，用哪个都行。脚本里的中文已按对应编码处理好，正常显示、不乱码。
+
+**方式 B：PowerShell 直接粘贴一条命令**
+
+```powershell
+& "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --remote-debugging-port=9222 --user-data-dir="C:\selenium_edge_profile"
+```
+
+> **`msedge.exe` 的路径怎么填**：上面的完整路径就是 Edge 的安装位置。绝大多数 64 位 Windows 是 `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`；如果你的 Edge 装在别处（例如没有 `(x86)`，变成 `C:\Program Files\Microsoft\Edge\Application\msedge.exe`），把它换成你机器上的真实路径即可。最省事的确认办法：资源管理器里找到 `msedge.exe` 所在文件夹，复制它的完整路径替换进去。
+>
+> 命令里另外两个参数**别动**：`--remote-debugging-port=9222` 是调试端口（要和代码里的 `DEBUG_ADDRESS` 一致），`--user-data-dir=...` 是独立配置目录（不影响你日常浏览器）。
 
 > 这一步开的是「远程调试端口」，脚本稍后通过它附着到这个已登录的窗口，所以登录态是现成的，代码不需要碰你的密码。
 
