@@ -1,0 +1,9 @@
+[project]
+name = "tieba-reply-deleter"
+version = "0.1.0"
+description = "批量删除百度贴吧里自己发过的回贴"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "selenium>=4.20.0",
+]
